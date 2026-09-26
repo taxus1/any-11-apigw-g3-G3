@@ -6,3 +6,19 @@ services:
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
+
+  # 访问流水落库的 MySQL（线上库表已由 DBA 建好；这里只是本地开发环境，首次启动自动建库建表）。
+  mysql:
+    image: mysql:8.0
+    container_name: apigw-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: apigw
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      # 容器首次初始化空数据目录时执行 /docker-entrypoint-initdb.d 下的脚本
+      - ./src/main/resources/db/access_log.mysql.sql:/docker-entrypoint-initdb.d/access_log.sql:ro

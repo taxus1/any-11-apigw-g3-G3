@@ -7,6 +7,18 @@ spring:
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
       database: ${REDIS_DB:0}
+  # 访问流水落库的数据源（库表 gw_access_log 已建好，DDL 见 resources/db/access_log.mysql.sql）
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/apigw?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root}
+    hikari:
+      pool-name: apigw-db-pool
+      maximum-pool-size: 8
+      minimum-idle: 1
+      connection-timeout: 2s
+      # 流水是旁路：池里借不到连接快速失败即可（写侧丢日志、查侧报错），不长时间占线程
+      max-lifetime: 30m
   cloud:
     gateway:
       # 路由定义从我们的 RedisRouteDefinitionRepository 读，不走 yml 静态路由
@@ -26,6 +38,19 @@ apigw:
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
     route-refresh-interval-ms: 10000
+  # 访问流水（异步批量落库）。
+  # 攒批边界：攒够 200 条或第一条后最多等 1s 必落一次；正常退出给 5s 宽限冲完队列。
+  # 入队走 10000 有界队列、非阻塞：队列满宁可丢流水并计数告警，绝不反压转发。
+  # 库维护时可置 enabled=false，转发链路零碰库。
+  accesslog:
+    enabled: ${ACCESSLOG_ENABLED:true}
+    table-name: ${ACCESSLOG_TABLE:gw_access_log}
+    batch-size: 200
+    linger: 1s
+    queue-capacity: 10000
+    shutdown-wait: 5s
+    request-no-header: X-Request-Id
+    app-no-header: X-App-No
 
 logging:
   level:

@@ -1,0 +1,29 @@
+# 测试环境：不依赖外部 MySQL，用 H2（MySQL 兼容模式）建同构的 gw_access_log
+spring:
+  datasource:
+    url: jdbc:h2:mem:apigw-test;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/access_log.h2.sql
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: false
+
+apigw:
+  accesslog:
+    enabled: true
+    table-name: gw_access_log
+
+logging:
+  level:
+    com.apigw: warn

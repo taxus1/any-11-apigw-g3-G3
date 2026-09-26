@@ -2,6 +2,10 @@ package com.apigw.proxy;
 
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.accesslog.AccessLogRecord;
+import com.apigw.domain.accesslog.AccessLogSink;
+import com.apigw.proxy.accesslog.AccessLogBatchWriter;
+import com.apigw.proxy.accesslog.AccessLogProperties;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.config.GatewayProxyProperties;
 import com.apigw.proxy.forward.UpstreamForwarder;
@@ -27,6 +31,7 @@ import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 /**
  * 转发链路端到端测试（真实 Netty 服务端 + 真实 WebClient 上游 + JDK HttpServer 上游，无 Redis）。
@@ -50,6 +55,8 @@ class GatewayProxyFilterTest {
     private DisposableServer server;
     private String baseUrl;
     private WebClient client;
+    private RecordingSink dbSink;
+    private AccessLogBatchWriter dbWriter;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -69,9 +76,14 @@ class GatewayProxyFilterTest {
                 .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(nettyClient))
                 .build();
 
+        // 落库链路用内存 sink + 真批量 writer，顺带验证一笔一行、状态码/路由/追踪号不串
+        dbSink = new RecordingSink();
+        dbWriter = new AccessLogBatchWriter(dbSink, AccessLogProperties.defaults());
+        dbWriter.start();
         var filter = new GatewayProxyWebFilter(
                 catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
-                new AccessLogRecorder(), new ObjectMapper());
+                new AccessLogRecorder(), dbWriter, AccessLogProperties.defaults(),
+                new ObjectMapper());
 
         // 链尾 WebHandler：到这里的只有被判定为非转发流量（/api），回一个占位 200
         WebHandler tail = exchange -> {
@@ -96,6 +108,7 @@ class GatewayProxyFilterTest {
             server.disposeNow();
         }
         upstream.close();
+        dbWriter.shutdown();
     }
 
     // ---- 造路由的小工具 ----
@@ -329,8 +342,7 @@ class GatewayProxyFilterTest {
     }
 
     @Test
-    void traceId_isReturnedOnBothSuccessAndError() {
-        loadRoutes(route("order", upstream.baseUrl(),
+    void traceId_isReturnedOnBothSuccessAndError() {        loadRoutes(route("order", upstream.baseUrl(),
                 List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of()));
 
         var ok = client.get().uri(baseUrl + "/order/1").exchange().block();
@@ -344,5 +356,90 @@ class GatewayProxyFilterTest {
         // 不同请求的 traceId 不能串
         assertThat(traceOk).isNotEqualTo(traceErr);
         notFound.releaseBody().block();
+    }
+
+    @Test
+    void accessLogRow_onePerRequest_carriesRequestNoRouteStatusAndTiming() {
+        loadRoutes(route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of()));
+
+        var resp = client.get().uri(baseUrl + "/order/9?x=1")
+                .header("X-Request-Id", "caller-trace-777")
+                .header("X-App-No", "app-mall")
+                .exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.OK);
+        // 调用方追踪号原样回带，跨服务用它对账
+        assertThat(resp.headers().asHttpHeaders().getFirst("X-Gateway-Trace-Id"))
+                .isEqualTo("caller-trace-777");
+        resp.releaseBody().block();
+
+        await().untilAsserted(() -> assertThat(dbSink.rows).hasSize(1));
+        AccessLogRecord row = dbSink.rows.get(0);
+        assertThat(row.requestNo()).isEqualTo("caller-trace-777");
+        assertThat(row.routeNo()).isEqualTo("order");
+        assertThat(row.appNo()).isEqualTo("app-mall");
+        assertThat(row.method()).isEqualTo("GET");
+        assertThat(row.path()).isEqualTo("/order/9"); // 只记路径，不带查询串
+        assertThat(row.statusCode()).isEqualTo(200);
+        assertThat(row.elapsedMs()).isGreaterThanOrEqualTo(0);
+        assertThat(row.occurTime()).isNotNull();
+    }
+
+    @Test
+    void accessLogRow_recordsFailuresAndMissingRouteWithZeroOrGatewayStatus() {
+        loadRoutes(route("dead", "http://127.0.0.1:1",
+                List.of(cond("PATH_PREFIX", null, "/dead/", 1)), List.of()));
+
+        // 上游连不上：502 也必须留痕，不能只记成功的
+        var bad = client.get().uri(baseUrl + "/dead/x").exchange().block();
+        assertThat(bad.statusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
+        bad.releaseBody().block();
+        // 没匹配上路由：404，route 为空
+        var none = client.get().uri(baseUrl + "/nope").exchange().block();
+        assertThat(none.statusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        none.releaseBody().block();
+
+        await().untilAsserted(() -> assertThat(dbSink.rows).hasSize(2));
+        AccessLogRecord failed = dbSink.rows.get(0);
+        assertThat(failed.routeNo()).isEqualTo("dead");
+        assertThat(failed.statusCode()).isEqualTo(502);
+        AccessLogRecord noRoute = dbSink.rows.get(1);
+        assertThat(noRoute.routeNo()).isNull();
+        assertThat(noRoute.statusCode()).isEqualTo(404);
+        // 两段并发信息不串：路径各自跟各自的状态码
+        assertThat(failed.path()).isEqualTo("/dead/x");
+        assertThat(noRoute.path()).isEqualTo("/nope");
+    }
+
+    @Test
+    void accessLogRow_generatesRequestNo_whenCallerOmittedOrInvalid() {
+        loadRoutes(route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of()));
+
+        var ok1 = client.get().uri(baseUrl + "/order/a").exchange().block();
+        String gen = ok1.headers().asHttpHeaders().getFirst("X-Gateway-Trace-Id");
+        assertThat(gen).hasSize(32);
+        ok1.releaseBody().block();
+        // 非法值（含逗号）不沿用，改用生成号，不把脏值写进追踪号
+        var ok2 = client.get().uri(baseUrl + "/order/b")
+                .header("X-Request-Id", "bad,id").exchange().block();
+        String replaced = ok2.headers().asHttpHeaders().getFirst("X-Gateway-Trace-Id");
+        assertThat(replaced).hasSize(32).isNotEqualTo("bad,id");
+        ok2.releaseBody().block();
+
+        await().untilAsserted(() -> assertThat(dbSink.rows).hasSize(2));
+        assertThat(dbSink.rows).extracting(AccessLogRecord::requestNo)
+                .containsExactly(gen, replaced);
+    }
+
+    /** 测试用落库口：把整批行收进内存，供断言；批次语义与真 sink 一致（每次给一批）。 */
+    static final class RecordingSink implements AccessLogSink {
+        final java.util.List<AccessLogRecord> rows =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+        @Override
+        public void saveBatch(java.util.List<AccessLogRecord> batch) {
+            rows.addAll(batch);
+        }
     }
 }

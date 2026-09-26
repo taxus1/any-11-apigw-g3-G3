@@ -33,6 +33,13 @@ public class GlobalExceptionHandler {
         return Mono.just(Result.fail(msg));
     }
 
+    @ExceptionHandler(IllegalArgumentException.class)
+    public Mono<Result<Void>> handleIllegalArg(IllegalArgumentException e) {
+        // 入参非法（时间格式、时间跨度、分页越界等）是调用方问题，按业务失败收口而不是系统 500
+        log.warn("请求参数非法：{}", e.getMessage());
+        return Mono.just(Result.fail(e.getMessage()));
+    }
+
     @ExceptionHandler(Exception.class)
     public Mono<Result<Void>> handleOther(Exception e) {
         log.error("未处理的系统异常（多为配置或依赖故障）", e);

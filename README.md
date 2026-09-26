@@ -10,10 +10,14 @@ Spring Cloud Gateway（WebFlux 响应式）+ Redis 动态路由配置。JDK 17 /
 ## 起环境
 
 ```bash
-docker compose up -d                # 起 Redis（路由配置存在这里）
+docker compose up -d                # 起 Redis（路由配置）+ MySQL（访问流水，首启自动建 gw_access_log）
 mvn spring-boot:run                 # 网关，8080
 bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个终端）
 ```
+
+数据源走环境变量（默认指向本地 compose 起的 MySQL）：`DB_URL` / `DB_USERNAME` / `DB_PASSWORD`；
+库维护、临时关停流水可设 `ACCESSLOG_ENABLED=false`（此时转发完全不碰库，仍需数据源可用，
+若要连数据源自动配置一并去掉，用 `spring.autoconfigure.exclude` 排除 DataSource/JDBC 自动配置）。
 
 ## 管理接口
 
@@ -24,6 +28,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | GET | `/api/gateway/routes/{routeNo}` | 路由详情（含全部子项，按顺序号排好） |
 | GET | `/api/gateway/routes?pageNum=&pageSize=&keyword=` | 分页列表（每条带条件/动作计数） |
 | DELETE | `/api/gateway/routes/{routeNo}?expectVersion=` | 删除路由（整树清掉） |
+| GET | `/api/gateway/access-logs?startTime=&endTime=&routeNo=&statusCode=&requestNo=&pageNum=&pageSize=` | 访问流水翻账（条件可组合、分页） |
 
 所有接口返回统一结构 `{ code, msg, data }`：
 
@@ -140,12 +145,90 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 
 ### 访问审计（查账）
 
-- 专用 logger `access-log`，同一次请求记两段，靠同一个 `traceId` 拼回，不会串到别人：
-  - `phase=IN  traceId=... method=... path=... route=- upstream=-`
-  - `phase=OUT traceId=... method=... path=... route=... upstream=... status=... outcome=... elapsed=...ms`
+两层，互不替代：
+
+1. **文本审计日志**（专用 logger `access-log`），同一次请求记两段，靠同一个 `traceId` 拼回，不会串到别人：
+   - `phase=IN  traceId=... method=... path=... route=- upstream=-`
+   - `phase=OUT traceId=... method=... path=... route=... upstream=... status=... outcome=... elapsed=...ms`
+2. **访问流水落库**（`gw_access_log`，一笔请求一行），供事后按条件翻账，见下节。
+
 - 命中路由、上游地址、耗时、最终状态码、结果（FORWARDED/NO_ROUTE/UPSTREAM_*/CONFIG_UNAVAILABLE）都在 OUT 段；没匹配上的请求也记。
-- 写日志走独立守护线程 + 有界队列，反应式链路里只做一次微秒级入队；队列满宁可丢日志并计数告警，也不反压转发。
-- 调用方在每个响应（含错误）上都能拿到 `X-Gateway-Trace-Id`，直接和日志对账。
+- 文本日志走独立守护线程 + 有界队列，反应式链路里只做一次微秒级入队；队列满宁可丢日志并计数告警，也不反压转发。
+- 调用方在每个响应（含错误）上都能拿到 `X-Gateway-Trace-Id`，直接和日志/流水对账。
+
+## 访问流水（落库 + 翻账）
+
+库表 `gw_access_log`（线上已建好，权威 DDL 见 `src/main/resources/db/access_log.mysql.sql`，
+本地 `docker compose up` 起的 MySQL 首次启动自动建）。一行九列：
+
+| 列 | 口径 |
+| --- | --- |
+| `request_no` | 请求编号。调用方带了合法 `X-Request-Id` 就沿用（跨服务同号串联），没带/非法（非 `[A-Za-z0-9._-]{1,64}`）网关生成 32 位十六进制 UUID；响应经 `X-Gateway-Trace-Id` 带回 |
+| `route_no` | 命中的路由编号；没匹配上/配置不可用为空 |
+| `app_no` | 调进来的应用编号。鉴权上线前取 `X-App-No` 头（可配置），认不出来为空；鉴权落地后改从鉴权上下文取，切换点只在过滤器一处 |
+| `client_ip` | 客户端来源地址。**与鉴权、限流共用 `ClientIpResolver` 一个口径**：`X-Forwarded-For` 最左合法 IP → `X-Real-IP` → TCP 对端地址；跳过空/`unknown`/非 IP 形状的值，绝不 DNS 反查。安全前提：网关只部署在会清洗 XFF 的受控 LB 之后 |
+| `method` / `path` | 请求方法 / 请求路径（不含查询串），超长按列宽截断 |
+| `status_code` | 返回给调用方的真实 HTTP 码（上游 4xx/5xx 原样透传，也照记）；**拿不到状态码（上游连不上/超时、响应未提交、连接中断）统一记 `0`**——失败请求一样留痕，用 `statusCode=0` 专查这类事故 |
+| `elapsed_ms` | 请求进来到响应结束的毫秒数 |
+| `occur_time` | 发生时间（请求进来的时刻，毫秒精度），不是落库时刻 |
+
+### 写链路怎么不拖慢转发
+
+```
+请求线程（反应式 event loop）：只做 [非阻塞 offer 进有界队列]，微秒级，绝不等库
+后台单守护线程 access-log-db-writer：凑批 → 一条多行 INSERT 落库 → 逐条兜底
+```
+
+- **攒批边界**（`apigw.accesslog.*` 可调）：
+  - 条数：攒够 `batch-size`（默认 200，硬上限 1000）立刻落；
+  - 时间：第一条进来后最多等 `linger`（默认 1s）必落一次，低峰不压数据；
+  - 退出：正常停机先封口队列，worker 立即停止等待把队列里没落完的逐批冲库，
+    宽限 `shutdown-wait`（默认 5s），到点放弃——不丢数据也不无限拖住停机。
+- **背压口径**：入队队列有界（`queue-capacity` 默认 10000）。满了直接丢这一条并计数告警，
+  不阻塞、不抛异常——丢流水是可接受的降级，拖垮转发不是。
+- **不写半条记录**：每批是**一条多行 `INSERT`（单语句 = InnoDB 单隐式事务，整批全成全败）**，
+  网关主路径没有事务上下文也不依赖它；单条列在记录构造时就校验/截断，不会出现半行。
+  整批失败（多为库抖动）先转**逐条单语句**兜底，把好的救回来；还写不进的只计数 + error 日志，
+  异常在后台线程内全部收口，永远不冒到转发链路上。
+- IN/OUT 两段信息怎么不串：一行流水在请求结束（`doFinally`）时由**本次请求栈上的局部量**
+  （编号/来源/应用/方法/路径/发生时间）和**只挂在本次 exchange 上的结果引用**
+  （路由/状态码/耗时）拼成一个不可变 `AccessLogRecord` 再入队，物理上不可能把 A 的路径配到 B 的状态码。
+- 总开关 `apigw.accesslog.enabled=false`：转发链路零碰库（装配空写入器），库维护时用。
+
+### 翻账接口
+
+`GET /api/gateway/access-logs`，条件可任意组合：
+
+| 参数 | 说明 |
+| --- | --- |
+| `startTime` / `endTime` | 发生时间段，ISO-8601 `yyyy-MM-ddTHH:mm:ss`；start 必填、end 默认当前、区间为 **[start, end)**；跨度封顶 31 天 |
+| `routeNo` | 路由编号精确匹配 |
+| `statusCode` | 状态码精确匹配（`0` 专查拿不到码的失败） |
+| `requestNo` | 请求编号/调用方追踪号精确对单 |
+| `pageNum` / `pageSize` | 页码从 1 开始；每页默认 20、**上限 200**（传超按 200 算） |
+
+返回仍是统一 Result 包裹的 PageResult：`content / total / pageNum / pageSize / totalPages`。
+`total` 与当页用**同一套 WHERE**（一条 COUNT、一条分页），数字严格对得上；
+排序固定 `occur_time DESC, id DESC`（同毫秒内 id 兜底稳定次序，翻页不重不漏）。
+JDBC 是阻塞调用，查询统一切到 `boundedElastic` 阻塞工作池，不占反应式事件循环。
+
+```bash
+curl 'http://localhost:8080/api/gateway/access-logs?startTime=2026-09-26T00:00:00&endTime=2026-09-27T00:00:00&routeNo=order&statusCode=502&pageNum=1&pageSize=20'
+```
+
+### 索引（为什么这么建）
+
+```sql
+KEY idx_occur_time_id (occur_time, id)            -- 无附加条件的时间段翻账：范围扫描 + 倒序免 filesort
+KEY idx_route_occur  (route_no, occur_time)       -- 时间 + 路由
+KEY idx_status_occur (status_code, occur_time)    -- 时间 + 状态码（含 status=0 事故筛查）
+KEY idx_request_no   (request_no)                 -- 按追踪号反查整条跨服务链路
+```
+
+- 时间翻账是绝对主场景（startTime 必填），时间列在每条索引里都参与，最左前缀直接收窄；
+- 等值列在前、范围/排序列在后，是组合筛选的标准建法；`(occur_time, id)` 让倒序翻页走索引序；
+- `request_no` 只建普通索引**不建唯一**：调用方可能重号/重试，网关不能因约束冲突把流水写崩；
+- 深分页防护：时间窗 31 天封顶 + pageSize 200 封顶，避免一条无界 `OFFSET` 扫垮库；再大的量请走离线数仓。
 
 ## 配置怎么存
 
@@ -183,6 +266,10 @@ mvn test
 - `RouteCatalogTest`：快照缓存、变更事件即时生效、Redis 故障沿用旧快照、并发冷加载不打雷群。
 - `GatewayProxyFilterTest`：真实 Netty 服务端 + 真实 WebClient 上游 + JDK HTTP 上游的端到端（无 Redis），覆盖方法/路径/查询/请求体转发、请求与响应头增删改、404/502/504 三态、报文绑定头不照抄、热刷新、traceId。
 - `AccessLogRecorderTest`：进/出两段 traceId 串联、不串请求、异步不阻塞。
+- `ClientIpResolverTest` / `RequestNoResolverTest`：来源地址取值顺序（XFF 最左合法→X-Real-IP→TCP 对端）、追踪号沿用/生成/非法值口径。
+- `AccessLogBatchWriterTest`：攒批条数边界、linger 时间边界、退出冲库不丢、队列满非阻塞丢弃、整批失败逐条兜底、sink 持续故障 worker 不死不外冒。
+- `JdbcAccessLogRepositoryTest`（H2 MySQL 模式）：多行整批落库、时间/路由/状态码组合筛选、分页四元组与排序、`status=0` 可筛、时间窗与 pageSize 封顶。
+- `AccessLogControllerTest`：真实容器 + H2 的翻账接口端到端，覆盖组合条件、分页数字、非法入参按业务失败返回。
 - `GatewayProxyIT`：真实容器 + 真实 Redis + 真实上游，建完路由立刻能转发、删完立刻失效；探不到 Redis 时自动跳过。
 
 ## 已知边界（留给后续题目）

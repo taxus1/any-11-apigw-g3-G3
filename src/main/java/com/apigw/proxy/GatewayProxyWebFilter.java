@@ -1,6 +1,11 @@
 package com.apigw.proxy;
 
 import com.apigw.domain.route.GatewayRoute;
+import com.apigw.domain.accesslog.AccessLogRecord;
+import com.apigw.proxy.accesslog.AccessLogBatchWriter;
+import com.apigw.proxy.accesslog.AccessLogProperties;
+import com.apigw.proxy.accesslog.ClientIpResolver;
+import com.apigw.proxy.accesslog.RequestNoResolver;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.action.HeaderActionApplier;
 import com.apigw.proxy.error.GatewayErrors;
@@ -22,10 +27,10 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
+import java.time.LocalDateTime;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -66,17 +71,23 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     private final RouteMatcher routeMatcher;
     private final UpstreamForwarder forwarder;
     private final AccessLogRecorder accessLog;
+    private final AccessLogBatchWriter accessLogDb;
+    private final AccessLogProperties accessLogProps;
     private final ObjectMapper objectMapper;
 
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
                                  UpstreamForwarder forwarder,
                                  AccessLogRecorder accessLog,
+                                 AccessLogBatchWriter accessLogDb,
+                                 AccessLogProperties accessLogProps,
                                  ObjectMapper objectMapper) {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
         this.forwarder = forwarder;
         this.accessLog = accessLog;
+        this.accessLogDb = accessLogDb;
+        this.accessLogProps = accessLogProps;
         this.objectMapper = objectMapper;
     }
 
@@ -92,10 +103,22 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
             return chain.filter(exchange);
         }
 
-        String traceId = newTraceId();
+        // 请求编号：调用方带了合法追踪号就沿用（跨服务同号串联），没带/不合法就我们生成。
+        // 它同时作为本次转发的 traceId，响应经 X-Gateway-Trace-Id 原样带回，便于和流水对账。
+        String requestNo = RequestNoResolver.resolve(exchange.getRequest(),
+                accessLogProps.requestNoHeader());
+        if (!RequestNoResolver.isAcceptable(requestNo)) {
+            log.warn("调用方追踪号头 {} 带了不合法值（{}），改用网关生成号",
+                    accessLogProps.requestNoHeader(), requestNo);
+            requestNo = RequestNoResolver.generate();
+        }
+        String traceId = requestNo;
         long startNanos = System.nanoTime();
+        LocalDateTime occurTime = LocalDateTime.now();
         String method = exchange.getRequest().getMethod() == null
                 ? "-" : exchange.getRequest().getMethod().name();
+        String clientIp = ClientIpResolver.resolve(exchange.getRequest());
+        String appNo = resolveAppNo(exchange);
 
         // 记账用的「这次到底怎样了」：无论从哪个分支结束，doFinally 都拿它写唯一一条 OUT 日志，
         // 避免成功记一遍、失败又记一遍，让同一次请求在审计里出现两条结果
@@ -136,10 +159,22 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                 })
                 .doFinally(sig -> {
                     Outcome o = outcome.get();
+                    // 状态码口径：正常/业务失败都拿到真实码；上游连不上/超时/响应未提交等
+                    // 拿不到码的场景（statusCode 为 null）统一记 0，失败请求一样留痕、不漏记
                     int status = exchange.getResponse().getStatusCode() == null
-                            ? 0 : exchange.getResponse().getStatusCode().value();
+                            ? AccessLogRecord.NO_STATUS
+                            : exchange.getResponse().getStatusCode().value();
+                    long elapsed = elapsedMillis(startNanos);
                     accessLog.logOutcome(traceId, method, path, o.routeNo(), o.upstream(),
-                            status, o.result(), elapsedMillis(startNanos));
+                            status, o.result(), elapsed);
+                    // 一行流水在这里「进/出两段」拼齐：入段（编号/来源/应用/方法/路径/发生时间）
+                    // 是本次请求栈上的局部量，出段（路由/状态码/耗时）取自只属于本次 exchange 的
+                    // AtomicReference，物理上不可能把 A 的路径配到 B 的状态码上
+                    AccessLogRecord entry = new AccessLogRecord(
+                            traceId, o.routeNo(), appNo, clientIp, method, path,
+                            status, elapsed, occurTime);
+                    // 唯一动作是非阻塞入队；库慢/库挂只影响后台 writer，绝不在请求路上等
+                    accessLogDb.record(entry);
                 });
     }
 
@@ -194,8 +229,17 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         return false;
     }
 
-    private static String newTraceId() {
-        return UUID.randomUUID().toString().replace("-", "");
+    /**
+     * 应用编号：鉴权上线前先按约定头 X-App-No（可配置）认，带了非空值就记；
+     * 认不出来（没带/空）留空。鉴权落地后改为从鉴权上下文取，口径只在这一处切换。
+     */
+    private String resolveAppNo(ServerWebExchange exchange) {
+        String v = exchange.getRequest().getHeaders().getFirst(accessLogProps.appNoHeader());
+        if (v == null || v.isBlank()) {
+            return null;
+        }
+        String trimmed = v.trim();
+        return trimmed.length() <= 64 ? trimmed : trimmed.substring(0, 64);
     }
 
     /** 上游状态码原样透传；非标准码（resolve 返回 null）退化成 502，不让框架抛异常。 */
